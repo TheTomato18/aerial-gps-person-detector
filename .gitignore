@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+
+# Model / training outputs
+*.pt
+*.pth
+*.onnx
+runs/
+wandb/
+mlruns/
+*.log
+*.cache
+
+# Dataset
+heridal_yolo26_dir/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
