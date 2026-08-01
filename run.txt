@@ -1,0 +1,1 @@
+python drone_geolocation.py test_footage\DJI_0753.MP4 "test_footage\Aug-30th-2022-12-59PM-Flight-Airdata.csv" --weights runs\detect\heridal_yolo26n\weights\best.pt -o flight_map.html
