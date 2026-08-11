@@ -7,7 +7,8 @@ that moment are then used to project each detection's pixel offset into a
 GPS coordinate. Detections that fall within a set distance of each other
 across multiple frames are merged into a single marker, which is confirmed
 only once enough frames agree on it. The result is a standalone interactive
-HTML map (flight path plus detection markers), rendered with Folium.
+HTML map (flight path plus detection markers), rendered with Folium, plus a
+saved snapshot image of each confirmed detection for visual confirmation.
 
 The rhumb-line and great-circle distance formulas used for this projection
 are implemented directly below to avoid an extra geospatial dependency.
@@ -17,9 +18,11 @@ Dependencies: pip install -r requirements.txt
 """
 
 import argparse
+import base64
 import math
+import os
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import cv2
 import pandas as pd
@@ -36,6 +39,13 @@ CONFIG = {
     # wait until a detection is made on this many distinct frames before
     # treating it as a confirmed marker
     "MIN_DETECTIONS_TO_MAKE_VISIBLE": 3,
+    # saved snapshots are cropped to this multiple of the detection's bounding
+    # box, so the surrounding terrain is visible around the subject
+    "SNAPSHOT_CONTEXT_MULTIPLE": 4.0,
+    # ...but never to a window smaller than this, since aerial detections are tiny
+    "SNAPSHOT_MIN_SIZE_PX": 256,
+    # width of the snapshot thumbnail embedded in each map popup
+    "SNAPSHOT_THUMBNAIL_WIDTH_PX": 320,
 }
 
 EARTH_RADIUS_M = 6371008.8  # mean Earth radius, in meters
@@ -84,10 +94,23 @@ def haversine_distance_km(lon1: float, lat1: float, lon2: float, lat2: float) ->
 # ---------------------------------------------------------------------------
 
 @dataclass
+class Snapshot:
+    """A cropped, annotated image of a single detection, held in memory until
+    its cluster is confirmed and the crop is written to disk."""
+    image: Any            # BGR image array (an annotated crop of the frame)
+    score: float
+    frame_index: int
+    time_s: float
+
+
+@dataclass
 class FoundPoint:
     location: Tuple[float, float]                     # running average (lon, lat)
     points: List[Tuple[float, float]] = field(default_factory=list)
     visible: bool = False
+    # highest-confidence snapshot seen for this cluster, and where it was saved
+    snapshot: Optional[Snapshot] = None
+    snapshot_path: Optional[str] = None
 
 
 @dataclass
@@ -177,7 +200,8 @@ def extract_video_segment(observations: pd.DataFrame) -> pd.DataFrame:
 # close enough, otherwise starts a new one)
 # ---------------------------------------------------------------------------
 
-def _merge_or_add_detection(found_points: List[FoundPoint], lon: float, lat: float) -> None:
+def _merge_or_add_detection(found_points: List[FoundPoint], lon: float, lat: float,
+                            snapshot: Optional[Snapshot] = None) -> None:
     min_separation_km = CONFIG["MIN_SEPARATION_OF_DETECTIONS_IN_METERS"] / 1000
 
     for fp in found_points:
@@ -187,16 +211,124 @@ def _merge_or_add_detection(found_points: List[FoundPoint], lon: float, lat: flo
             avg_lon = sum(pt[0] for pt in fp.points) / len(fp.points)
             avg_lat = sum(pt[1] for pt in fp.points) / len(fp.points)
             fp.location = (avg_lon, avg_lat)
+            # keep only the clearest look at this cluster
+            if snapshot is not None and (fp.snapshot is None or snapshot.score > fp.snapshot.score):
+                fp.snapshot = snapshot
             if len(fp.points) >= CONFIG["MIN_DETECTIONS_TO_MAKE_VISIBLE"]:
                 fp.visible = True
             return
 
-    found_points.append(FoundPoint(location=(lon, lat), points=[(lon, lat)]))
+    found_points.append(FoundPoint(location=(lon, lat), points=[(lon, lat)], snapshot=snapshot))
+
+
+def _is_confirmed(fp: FoundPoint) -> bool:
+    return len(fp.points) >= CONFIG["MIN_DETECTIONS_TO_MAKE_VISIBLE"]
+
+
+# ---------------------------------------------------------------------------
+# Detection snapshots
+# ---------------------------------------------------------------------------
+
+def crop_detection(frame, bbox: BBox):
+    """Cuts a context window around `bbox` out of `frame` and draws the
+    detection box onto the copy, so a reviewer can see both the subject and
+    the terrain around it."""
+    height, width = frame.shape[:2]
+    box_w, box_h = max(bbox.w, 1.0), max(bbox.h, 1.0)
+
+    # window is a multiple of the box, floored at a minimum size and capped
+    # at the frame itself
+    span = max(box_w, box_h) * CONFIG["SNAPSHOT_CONTEXT_MULTIPLE"]
+    span = max(span, float(CONFIG["SNAPSHOT_MIN_SIZE_PX"]))
+    span = min(span, float(min(width, height)))
+    half = span / 2
+
+    # shift the window back inside the frame rather than letting it clip, so
+    # detections near an edge still get a full-size snapshot
+    left = int(round(min(max(bbox.x - half, 0.0), width - span)))
+    top = int(round(min(max(bbox.y - half, 0.0), height - span)))
+    right = min(left + int(round(span)), width)
+    bottom = min(top + int(round(span)), height)
+
+    crop = frame[top:bottom, left:right].copy()
+    if crop.size == 0:
+        return None
+
+    x1 = max(int(round(bbox.x - box_w / 2)) - left, 0)
+    y1 = max(int(round(bbox.y - box_h / 2)) - top, 0)
+    x2 = min(int(round(bbox.x + box_w / 2)) - left, crop.shape[1] - 1)
+    y2 = min(int(round(bbox.y + box_h / 2)) - top, crop.shape[0] - 1)
+    cv2.rectangle(crop, (x1, y1), (x2, y2), (0, 140, 255), 2)
+    return crop
+
+
+def _format_timestamp(time_s: float) -> str:
+    return f"{int(time_s // 60):02d}:{time_s % 60:04.1f}"
+
+
+def save_snapshots(found_points: List[FoundPoint], output_dir: str) -> int:
+    """Writes one snapshot image per confirmed detection cluster into
+    `output_dir`, recording the path on each cluster. Returns the number of
+    images written."""
+    confirmed = [fp for fp in found_points if _is_confirmed(fp) and fp.snapshot is not None]
+    if not confirmed:
+        return 0
+
+    os.makedirs(output_dir, exist_ok=True)
+    written = 0
+    for i, fp in enumerate(confirmed, start=1):
+        lon, lat = fp.location
+        path = os.path.join(output_dir, f"detection_{i:02d}.jpg")
+        if not cv2.imwrite(path, fp.snapshot.image):
+            print(f"Warning: could not write snapshot {path}")
+            continue
+        fp.snapshot_path = path
+        written += 1
+        print(f"  {path}  ({lat:.6f}, {lon:.6f})  conf {fp.snapshot.score:.2f}  "
+              f"at {_format_timestamp(fp.snapshot.time_s)}")
+    return written
+
+
+def _thumbnail_data_uri(image) -> Optional[str]:
+    """Encodes a snapshot as a base64 JPEG data URI so it can be embedded
+    directly in the map popup, keeping the HTML standalone."""
+    width = CONFIG["SNAPSHOT_THUMBNAIL_WIDTH_PX"]
+    if image.shape[1] > width:
+        scale = width / image.shape[1]
+        image = cv2.resize(image, (width, max(int(image.shape[0] * scale), 1)),
+                           interpolation=cv2.INTER_AREA)
+    ok, buffer = cv2.imencode(".jpg", image)
+    if not ok:
+        return None
+    return "data:image/jpeg;base64," + base64.b64encode(buffer.tobytes()).decode("ascii")
 
 
 # ---------------------------------------------------------------------------
 # Map rendering
 # ---------------------------------------------------------------------------
+
+def _marker_popup_html(fp: FoundPoint) -> str:
+    """Popup for one confirmed detection: its snapshot (if one was captured)
+    above the coordinates and supporting evidence."""
+    lon, lat = fp.location
+
+    image_tag = ""
+    if fp.snapshot is not None:
+        data_uri = _thumbnail_data_uri(fp.snapshot.image)
+        if data_uri:
+            image_tag = f'<img src="{data_uri}" style="width:100%;border-radius:4px;">'
+
+    lines = [f"<b>{len(fp.points)} detections</b>", f"{lat:.6f}, {lon:.6f}"]
+    if fp.snapshot is not None:
+        lines.append(f"best frame {fp.snapshot.frame_index} at "
+                     f"{_format_timestamp(fp.snapshot.time_s)} "
+                     f"(conf {fp.snapshot.score:.2f})")
+    if fp.snapshot_path:
+        lines.append(f"<code>{os.path.basename(fp.snapshot_path)}</code>")
+
+    return (f'<div style="font-family:sans-serif;font-size:12px;width:320px;">'
+            f'{image_tag}<div style="margin-top:6px;">{"<br>".join(lines)}</div></div>')
+
 
 def build_map(video_obs: pd.DataFrame, found_points: List[FoundPoint], output_path: str) -> int:
     """Renders the flight path and any confirmed detection markers to a
@@ -216,11 +348,11 @@ def build_map(video_obs: pd.DataFrame, found_points: List[FoundPoint], output_pa
 
     visible_count = 0
     for fp in found_points:
-        if len(fp.points) >= CONFIG["MIN_DETECTIONS_TO_MAKE_VISIBLE"]:
+        if _is_confirmed(fp):
             lon, lat = fp.location
             folium.Marker(
                 location=[lat, lon],
-                popup=f"{len(fp.points)} detections",
+                popup=folium.Popup(_marker_popup_html(fp), max_width=400),
                 icon=folium.Icon(color="orange", icon="info-sign"),
             ).add_to(fmap)
             visible_count += 1
@@ -234,10 +366,13 @@ def build_map(video_obs: pd.DataFrame, found_points: List[FoundPoint], output_pa
 # ---------------------------------------------------------------------------
 
 def process_video(video_path: str, flight_log_path: str, model: Optional[DetectionModel],
-                   output_html: str, detection_interval_s: float = 0.2) -> List[FoundPoint]:
+                   output_html: str, detection_interval_s: float = 0.2,
+                   snapshot_dir: Optional[str] = "detections") -> List[FoundPoint]:
     """Runs the full pipeline: parse the flight log, detect objects in the
-    video, geolocate and de-duplicate detections, and write the HTML map.
-    If `model` is None, only the flight path is plotted."""
+    video, geolocate and de-duplicate detections, save a snapshot image of
+    each confirmed detection, and write the HTML map. If `model` is None,
+    only the flight path is plotted; if `snapshot_dir` is None, no images
+    are saved (they are still embedded in the map popups)."""
     observations = read_flight_log(flight_log_path)
     video_obs = extract_video_segment(observations)
     if video_obs.empty:
@@ -303,11 +438,23 @@ def process_video(video_path: str, flight_log_path: str, model: Optional[Detecti
                     angle += 180
 
                 point_lon, point_lat = rhumb_destination(lon, lat, distance_m, (bearing + angle) % 360)
-                _merge_or_add_detection(found_points, point_lon, point_lat)
+
+                crop = crop_detection(frame, p.bbox)
+                snapshot = None if crop is None else Snapshot(
+                    image=crop,
+                    score=p.score,
+                    frame_index=frame_index - 1,  # frame_index was already advanced
+                    time_s=current_time,
+                )
+                _merge_or_add_detection(found_points, point_lon, point_lat, snapshot)
 
         cap.release()
     else:
         print("No model provided - skipping detection, plotting flight path only.")
+
+    if snapshot_dir:
+        saved = save_snapshots(found_points, snapshot_dir)
+        print(f"Saved {saved} detection snapshot(s) to {snapshot_dir}/")
 
     visible = build_map(video_obs, found_points, output_html)
     print(f"Wrote {output_html} with {visible} marker(s) out of "
@@ -324,10 +471,16 @@ def main():
     parser.add_argument("--weights", help="Path to YOLO weights (.pt). If omitted, only the flight path is plotted.")
     parser.add_argument("--conf", type=float, default=0.4, help="Detection confidence threshold")
     parser.add_argument("--interval", type=float, default=0.2, help="Seconds of footage between detection passes")
+    parser.add_argument("--snapshots", default="detections",
+                        help="Directory to save an image of each confirmed detection into")
+    parser.add_argument("--no-snapshots", action="store_true",
+                        help="Skip writing snapshot images (they are still embedded in the map)")
     args = parser.parse_args()
 
     model = YoloDetector(args.weights, conf=args.conf) if args.weights else None
-    process_video(args.video, args.flight_log, model, args.output, detection_interval_s=args.interval)
+    process_video(args.video, args.flight_log, model, args.output,
+                  detection_interval_s=args.interval,
+                  snapshot_dir=None if args.no_snapshots else args.snapshots)
 
 
 if __name__ == "__main__":

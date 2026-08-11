@@ -20,9 +20,10 @@ mlruns/
 # Dataset
 heridal_yolo26_dir/
 
-# Flight footage / logs / generated maps (large, and may contain real GPS data)
+# Flight footage / logs / generated maps + snapshots (large, and may contain real GPS data)
 test_footage/
 flight_map.html
+detections/
 
 # Editor / OS
 .vscode/
