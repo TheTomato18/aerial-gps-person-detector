@@ -1,5 +1,4 @@
-"""
-Geolocates detections from a drone video against its flight-log CSV.
+"""Geolocate detections from a drone video against its flight-log CSV.
 
 For each sampled video frame, a detection model locates objects in image
 space. The drone's recorded GPS position, altitude, and compass heading at
@@ -10,11 +9,16 @@ only once enough frames agree on it. The result is a standalone interactive
 HTML map (flight path plus detection markers), rendered with Folium, plus a
 saved snapshot image of each confirmed detection for visual confirmation.
 
-The rhumb-line and great-circle distance formulas used for this projection
-are implemented directly below to avoid an extra geospatial dependency.
+The rhumb-line and great-circle distance formulas used for the projection
+are implemented below rather than pulled in from a geospatial library, to
+keep the dependency list short.
 
-Dependencies: pip install -r requirements.txt
-(ultralytics is only required when passing --weights)
+Typical usage:
+    python drone_geolocation.py flight.mp4 flight.csv \\
+        --weights runs/detect/heridal_yolo26n/weights/best.pt
+
+Dependencies are listed in requirements.txt; ultralytics is imported only
+when --weights is supplied.
 """
 
 import argparse
@@ -56,9 +60,23 @@ EARTH_RADIUS_M = 6371008.8  # mean Earth radius, in meters
 # ---------------------------------------------------------------------------
 
 def rhumb_destination(lon: float, lat: float, distance_m: float, bearing_deg: float) -> Tuple[float, float]:
-    """Given a start point, a distance (meters), and a bearing (degrees),
-    return the (lon, lat) reached by travelling along a rhumb line (a path
-    of constant compass bearing)."""
+    """Travel along a rhumb line from a start point and return where it ends.
+
+    A rhumb line is a path of constant compass bearing, which is the natural
+    fit here: the bearing to a detection is fixed by the camera geometry, and
+    the distances involved are short enough that the difference from a great
+    circle is negligible.
+
+    Args:
+        lon: Longitude of the start point, in degrees.
+        lat: Latitude of the start point, in degrees.
+        distance_m: Distance to travel, in meters.
+        bearing_deg: Compass bearing to travel along, in degrees.
+
+    Returns:
+        The (longitude, latitude) of the destination in degrees, with
+        longitude normalised to [-180, 180).
+    """
     delta = distance_m / EARTH_RADIUS_M  # angular distance in radians
     lambda1 = math.radians(lon)
     phi1 = math.radians(lat)
@@ -79,7 +97,14 @@ def rhumb_destination(lon: float, lat: float, distance_m: float, bearing_deg: fl
 
 
 def haversine_distance_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
-    """Great-circle distance between two points, in kilometers."""
+    """Return the great-circle distance between two points, in kilometers.
+
+    Args:
+        lon1: Longitude of the first point, in degrees.
+        lat1: Latitude of the first point, in degrees.
+        lon2: Longitude of the second point, in degrees.
+        lat2: Latitude of the second point, in degrees.
+    """
     r_km = EARTH_RADIUS_M / 1000.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     d_phi = math.radians(lat2 - lat1)
@@ -95,17 +120,26 @@ def haversine_distance_km(lon1: float, lat1: float, lon2: float, lat2: float) ->
 
 @dataclass
 class Snapshot:
-    """A cropped, annotated image of a single detection, held in memory until
-    its cluster is confirmed and the crop is written to disk."""
-    image: Any            # BGR image array (an annotated crop of the frame)
-    score: float
-    frame_index: int
-    time_s: float
+    """A cropped, annotated image of a single detection.
+
+    Held in memory while frames are processed, and written to disk only if
+    the cluster it belongs to ends up confirmed.
+    """
+    image: Any        # BGR image array (an annotated crop of the frame)
+    score: float      # detector confidence for this detection
+    frame_index: int  # zero-based index of the frame it was taken from
+    time_s: float     # timestamp of that frame within the video
 
 
 @dataclass
 class FoundPoint:
-    location: Tuple[float, float]                     # running average (lon, lat)
+    """A cluster of detections taken to be the same subject on the ground.
+
+    Detections landing within MIN_SEPARATION_OF_DETECTIONS_IN_METERS of the
+    cluster are merged into it, and the cluster is plotted once at least
+    MIN_DETECTIONS_TO_MAKE_VISIBLE frames agree on it.
+    """
+    location: Tuple[float, float]                     # mean (lon, lat) of `points`
     points: List[Tuple[float, float]] = field(default_factory=list)
     visible: bool = False
     # highest-confidence snapshot seen for this cluster, and where it was saved
@@ -115,17 +149,19 @@ class FoundPoint:
 
 @dataclass
 class BBox:
-    x: float  # pixel-space center x of the detection
-    y: float  # pixel-space center y of the detection
-    w: float = 0.0
-    h: float = 0.0
+    """An axis-aligned detection box, in pixel space."""
+    x: float          # center x of the detection
+    y: float          # center y of the detection
+    w: float = 0.0    # full width
+    h: float = 0.0    # full height
 
 
 @dataclass
 class Prediction:
+    """A single object located in one frame."""
     bbox: BBox
-    score: float = 1.0
-    label: str = ""
+    score: float = 1.0  # detector confidence, 0-1
+    label: str = ""     # class name reported by the model
 
 
 # ---------------------------------------------------------------------------
@@ -134,20 +170,46 @@ class Prediction:
 # ---------------------------------------------------------------------------
 
 class DetectionModel:
+    """The seam between this pipeline and whatever detector is plugged in.
+
+    Any model can be used here as long as it locates objects in a single
+    frame and reports them in pixel space; see YoloDetector for a worked
+    implementation.
+    """
+
     def detect(self, frame) -> List[Prediction]:
+        """Locate objects in `frame`, a BGR image array.
+
+        Implementations are expected to apply their own confidence
+        threshold and to return an empty list when nothing is found.
+        """
         raise NotImplementedError
 
 
 class YoloDetector(DetectionModel):
-    """Thin wrapper so an Ultralytics YOLO model (e.g. weights produced by
-    train_model.py) drops straight into this pipeline."""
+    """A DetectionModel backed by an Ultralytics YOLO checkpoint.
+
+    Lets the weights produced by train_model.py drop straight into this
+    pipeline, converting Ultralytics' corner-format boxes into the
+    center-format BBox used here.
+    """
 
     def __init__(self, weights_path: str, conf: float = 0.4):
+        """Load a YOLO checkpoint.
+
+        Args:
+            weights_path: Path to a .pt checkpoint, e.g.
+                runs/detect/heridal_yolo26n/weights/best.pt.
+            conf: Confidence threshold below which detections are dropped.
+        """
+        # imported lazily so the module stays usable without ultralytics
+        # installed when no weights are supplied
         from ultralytics import YOLO
         self.model = YOLO(weights_path)
         self.conf = conf
 
     def detect(self, frame) -> List[Prediction]:
+        """Run the model over `frame` and convert its boxes to Predictions."""
         results = self.model.predict(frame, conf=self.conf, verbose=False)[0]
         preds = []
         for box in results.boxes:
@@ -166,16 +228,27 @@ class YoloDetector(DetectionModel):
 # ---------------------------------------------------------------------------
 
 def read_flight_log(csv_path: str) -> pd.DataFrame:
-    """Reads the flight-log CSV, stripping whitespace from column names."""
+    """Read a flight-log CSV, stripping whitespace from the column names.
+
+    Airdata exports pad some headers with spaces, which would otherwise
+    break the column lookups downstream.
+    """
     df = pd.read_csv(csv_path)
     df.columns = [c.strip() for c in df.columns]
     return df
 
 
 def extract_video_segment(observations: pd.DataFrame) -> pd.DataFrame:
-    """Returns the first continuous block of rows flagged `isVideo`: rows
-    before recording starts are skipped, and collection stops at the first
-    row after recording ends."""
+    """Return the first continuous block of rows flagged `isVideo`.
+
+    Rows logged before recording started are skipped, and collection stops
+    at the first row after it ended, so the result covers a single video.
+    Latitude and longitude are coerced to float.
+
+    Returns:
+        The matching rows, re-indexed from zero, or an empty DataFrame if
+        the log has no `isVideo` rows at all.
+    """
     video_rows = []
     started = False
     for _, row in observations.iterrows():
@@ -202,6 +275,12 @@ def extract_video_segment(observations: pd.DataFrame) -> pd.DataFrame:
 
 def _merge_or_add_detection(found_points: List[FoundPoint], lon: float, lat: float,
                             snapshot: Optional[Snapshot] = None) -> None:
+    """Fold a detection into a nearby cluster, or start a new one.
+
+    A detection within MIN_SEPARATION_OF_DETECTIONS_IN_METERS of an existing
+    cluster is merged into it, moving that cluster to the mean of its points
+    and keeping whichever snapshot the detector was most confident about.
+    """
     min_separation_km = CONFIG["MIN_SEPARATION_OF_DETECTIONS_IN_METERS"] / 1000
 
     for fp in found_points:
@@ -222,6 +301,7 @@ def _merge_or_add_detection(found_points: List[FoundPoint], lon: float, lat: flo
 
 
 def _is_confirmed(fp: FoundPoint) -> bool:
+    """Report whether enough frames agree on `fp` for it to be plotted."""
     return len(fp.points) >= CONFIG["MIN_DETECTIONS_TO_MAKE_VISIBLE"]
 
 
@@ -230,9 +310,18 @@ def _is_confirmed(fp: FoundPoint) -> bool:
 # ---------------------------------------------------------------------------
 
 def crop_detection(frame, bbox: BBox):
-    """Cuts a context window around `bbox` out of `frame` and draws the
-    detection box onto the copy, so a reviewer can see both the subject and
-    the terrain around it."""
+    """Cut a context window around `bbox` and draw the detection onto it.
+
+    The window is sized as a multiple of the box so a reviewer sees both the
+    subject and the terrain around it, floored at a minimum size because
+    aerial detections are only a handful of pixels across, and capped at the
+    frame. A window that would run off an edge is shifted back inside rather
+    than clipped, so every snapshot comes out the same size.
+
+    Returns:
+        The annotated crop as a BGR image array, or None if the crop came
+        out empty.
+    """
     height, width = frame.shape[:2]
     box_w, box_h = max(bbox.w, 1.0), max(bbox.h, 1.0)
 
@@ -263,13 +352,20 @@ def crop_detection(frame, bbox: BBox):
 
 
 def _format_timestamp(time_s: float) -> str:
+    """Format a position in the video, in seconds, as MM:SS.s."""
     return f"{int(time_s // 60):02d}:{time_s % 60:04.1f}"
 
 
 def save_snapshots(found_points: List[FoundPoint], output_dir: str) -> int:
-    """Writes one snapshot image per confirmed detection cluster into
-    `output_dir`, recording the path on each cluster. Returns the number of
-    images written."""
+    """Write one image per confirmed detection cluster into `output_dir`.
+
+    Images are named detection_NN.jpg and numbered in the same order the map
+    popups use, so a marker on the map can be traced back to a file on disk.
+    The path of each image is recorded on the cluster it came from.
+
+    Returns:
+        The number of images successfully written.
+    """
     confirmed = [fp for fp in found_points if _is_confirmed(fp) and fp.snapshot is not None]
     if not confirmed:
         return 0
@@ -290,8 +386,14 @@ def save_snapshots(found_points: List[FoundPoint], output_dir: str) -> int:
 
 
 def _thumbnail_data_uri(image) -> Optional[str]:
-    """Encodes a snapshot as a base64 JPEG data URI so it can be embedded
-    directly in the map popup, keeping the HTML standalone."""
+    """Encode a snapshot as a base64 JPEG data URI.
+
+    Embedding the image in the popup rather than linking to it keeps the
+    rendered map a single self-contained file.
+
+    Returns:
+        The data URI, or None if the image could not be encoded.
+    """
     width = CONFIG["SNAPSHOT_THUMBNAIL_WIDTH_PX"]
     if image.shape[1] > width:
         scale = width / image.shape[1]
@@ -308,8 +410,12 @@ def _thumbnail_data_uri(image) -> Optional[str]:
 # ---------------------------------------------------------------------------
 
 def _marker_popup_html(fp: FoundPoint) -> str:
-    """Popup for one confirmed detection: its snapshot (if one was captured)
-    above the coordinates and supporting evidence."""
+    """Build the map popup for one confirmed detection.
+
+    Shows the snapshot, if one was captured, above the coordinates and the
+    evidence behind the marker: how many frames agreed, and which frame the
+    snapshot came from.
+    """
     lon, lat = fp.location
 
     image_tag = ""
@@ -331,8 +437,14 @@ def _marker_popup_html(fp: FoundPoint) -> str:
 
 
 def build_map(video_obs: pd.DataFrame, found_points: List[FoundPoint], output_path: str) -> int:
-    """Renders the flight path and any confirmed detection markers to a
-    standalone HTML file; returns the number of confirmed markers."""
+    """Render the flight path and confirmed detections to a standalone file.
+
+    The map opens framed on the flight path, with unconfirmed clusters left
+    off entirely.
+
+    Returns:
+        The number of markers plotted.
+    """
     lats = video_obs["latitude"].tolist()
     lons = video_obs["longitude"].tolist()
     center = [sum(lats) / len(lats), sum(lons) / len(lons)]
@@ -366,13 +478,33 @@ def build_map(video_obs: pd.DataFrame, found_points: List[FoundPoint], output_pa
 # ---------------------------------------------------------------------------
 
 def process_video(video_path: str, flight_log_path: str, model: Optional[DetectionModel],
-                   output_html: str, detection_interval_s: float = 0.2,
-                   snapshot_dir: Optional[str] = "detections") -> List[FoundPoint]:
-    """Runs the full pipeline: parse the flight log, detect objects in the
-    video, geolocate and de-duplicate detections, save a snapshot image of
-    each confirmed detection, and write the HTML map. If `model` is None,
-    only the flight path is plotted; if `snapshot_dir` is None, no images
-    are saved (they are still embedded in the map popups)."""
+                  output_html: str, detection_interval_s: float = 0.2,
+                  snapshot_dir: Optional[str] = "detections") -> List[FoundPoint]:
+    """Run the full pipeline and write the HTML map.
+
+    Parses the flight log, detects objects in the video, geolocates and
+    de-duplicates those detections, saves a snapshot of each confirmed
+    cluster, and renders the map.
+
+    Args:
+        video_path: Path to the drone video.
+        flight_log_path: Path to the flight-log CSV recorded alongside it.
+        model: Detector to run over the footage. If None, only the flight
+            path is plotted.
+        output_html: Path to write the rendered map to.
+        detection_interval_s: Seconds of footage between detection passes.
+            Frames in between are read but not run through the detector.
+        snapshot_dir: Directory to write snapshot images into. If None, no
+            files are written, though thumbnails are still embedded in the
+            map popups.
+
+    Returns:
+        Every detection cluster found, confirmed or not.
+
+    Raises:
+        ValueError: If the flight log has no rows flagged `isVideo`.
+        IOError: If the video cannot be opened.
+    """
     observations = read_flight_log(flight_log_path)
     video_obs = extract_video_segment(observations)
     if video_obs.empty:
@@ -463,14 +595,18 @@ def process_video(video_path: str, flight_log_path: str, model: Optional[Detecti
 
 
 def main():
+    """Parse command-line arguments and run the pipeline."""
     parser = argparse.ArgumentParser(
         description="Geolocate objects detected in a drone video against its flight log.")
     parser.add_argument("video", help="Path to the drone video file")
     parser.add_argument("flight_log", help="Path to the flight-log CSV")
     parser.add_argument("-o", "--output", default="flight_map.html", help="Output HTML map path")
-    parser.add_argument("--weights", help="Path to YOLO weights (.pt). If omitted, only the flight path is plotted.")
-    parser.add_argument("--conf", type=float, default=0.4, help="Detection confidence threshold")
-    parser.add_argument("--interval", type=float, default=0.2, help="Seconds of footage between detection passes")
+    parser.add_argument("--weights",
+                        help="Path to YOLO weights (.pt). If omitted, only the flight path is plotted.")
+    parser.add_argument("--conf", type=float, default=0.4,
+                        help="Detection confidence threshold")
+    parser.add_argument("--interval", type=float, default=0.2,
+                        help="Seconds of footage between detection passes")
     parser.add_argument("--snapshots", default="detections",
                         help="Directory to save an image of each confirmed detection into")
     parser.add_argument("--no-snapshots", action="store_true",

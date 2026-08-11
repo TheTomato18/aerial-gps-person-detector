@@ -1,17 +1,27 @@
-"""
-Trains a YOLO26n person detector on the HERIDAL dataset.
+"""Train a YOLO26n person detector on the HERIDAL dataset.
 
-Fine-tunes `yolo26n.pt` against `heridal_yolo26_dir/data.yaml` (see
-README.md's Dataset section), reports validation and test metrics, then
-runs inference over the test images as a sanity check.
+Fine-tunes `yolo26n.pt` against `heridal_yolo26_dir/data.yaml` (see the
+Dataset section of README.md for how to obtain and lay out the data),
+reports validation and held-out test metrics, then runs inference over the
+test images as a visual sanity check.
 
-Dependencies: pip install -r requirements.txt
+Weights and other training artifacts are written to
+`runs/detect/heridal_yolo26n/`; the best checkpoint ends up at
+`weights/best.pt` there, which is what drone_geolocation.py --weights
+expects.
+
+Typical usage:
+    python train_model.py
+
+Dependencies are listed in requirements.txt. Training is impractical
+without a CUDA-capable GPU.
 """
 
 from ultralytics import YOLO
 
 
 def main():
+    """Fine-tune the detector, evaluate it, and preview its predictions."""
     model = YOLO("yolo26n.pt")
 
     model.train(
