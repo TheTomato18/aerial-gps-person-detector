@@ -19,3 +19,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-party notice: drone_geolocation.py is a port of code from Roboflow's
+dji-aerial-georeferencing, licensed under the Apache License 2.0. The terms
+of that license apply to the portions derived from it. See NOTICE for the
+attribution and record of changes, and LICENSE-APACHE-2.0 for its text.
