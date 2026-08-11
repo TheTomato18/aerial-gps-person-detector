@@ -1,0 +1,50 @@
+aerial-gps-person-detector
+Copyright (c) 2026 Nageeb Moin
+
+This product includes software developed by Roboflow.
+
+------------------------------------------------------------------------
+drone_geolocation.py
+------------------------------------------------------------------------
+
+drone_geolocation.py is a Python port of src/renderMap.js from Roboflow's
+dji-aerial-georeferencing project:
+
+    https://github.com/roboflow/dji-aerial-georeferencing
+
+That project is licensed under the Apache License, Version 2.0. A copy of
+the Apache License is included in this repository as LICENSE-APACHE-2.0,
+and may also be obtained at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+The following are carried over from renderMap.js:
+
+  - deriving the ground distance covered by a video frame from the
+    camera's diagonal field of view and the drone's altitude
+  - projecting a detection's pixel offset from frame center into a
+    bearing and distance from the drone, then to a GPS coordinate along
+    a rhumb line
+  - merging repeat detections of the same subject by averaging their
+    positions, and confirming a marker only once enough frames agree
+  - the CONFIG thresholds MIN_SEPARATION_OF_DETECTIONS_IN_METERS (20)
+    and MIN_DETECTIONS_TO_MAKE_VISIBLE (3), and their values
+
+drone_geolocation.py has been modified from the original. The changes are:
+
+  - rewritten from JavaScript into Python
+  - Turf.js rhumbDestination() and distance() reimplemented locally as
+    rhumb_destination() and haversine_distance_km()
+  - Mapbox GL replaced with Folium for map rendering
+  - Roboflow's hosted inference API replaced with a local Ultralytics
+    YOLO checkpoint, behind a pluggable DetectionModel interface
+  - flight-log parsing rewritten around pandas
+  - per-detection snapshot capture added, which the original does not have
+
+------------------------------------------------------------------------
+
+Except where stated above, this project is licensed under the MIT License;
+see LICENSE.
+
+The HERIDAL dataset used to train the detector is separately licensed under
+CC BY 4.0 and is not distributed with this repository.

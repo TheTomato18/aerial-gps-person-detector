@@ -13,6 +13,31 @@ The rhumb-line and great-circle distance formulas used for the projection
 are implemented below rather than pulled in from a geospatial library, to
 keep the dependency list short.
 
+Attribution
+-----------
+This module is a Python port of `src/renderMap.js` from Roboflow's
+dji-aerial-georeferencing project, used under the Apache License 2.0:
+
+    https://github.com/roboflow/dji-aerial-georeferencing
+
+The georeferencing approach is theirs. Carried over from that file
+directly: deriving the ground distance covered by a frame from the camera's
+field of view and the drone's altitude, projecting a detection's pixel
+offset into a bearing and distance from the drone, averaging repeat
+detections into a single position, and the two clustering thresholds in
+CONFIG below (MIN_SEPARATION_OF_DETECTIONS_IN_METERS,
+MIN_DETECTIONS_TO_MAKE_VISIBLE) along with their values.
+
+This file has been modified from the original. The changes are: a rewrite
+from JavaScript into Python; Turf.js's `rhumbDestination` and `distance`
+replaced with the local implementations below; Mapbox GL replaced with
+Folium; Roboflow's hosted inference API replaced with a local Ultralytics
+YOLO checkpoint behind the pluggable DetectionModel interface; flight-log
+parsing rewritten around pandas; and per-detection snapshot capture added,
+which the original does not have.
+
+See NOTICE for the full attribution.
+
 Typical usage:
     python drone_geolocation.py flight.mp4 flight.csv \\
         --weights runs/detect/heridal_yolo26n/weights/best.pt
@@ -46,7 +71,7 @@ CONFIG = {
     # saved snapshots are cropped to this multiple of the detection's bounding
     # box, so the surrounding terrain is visible around the subject
     "SNAPSHOT_CONTEXT_MULTIPLE": 4.0,
-    # ...but never to a window smaller than this, since aerial detections are tiny
+    # but never to a window smaller than this, since aerial detections are tiny
     "SNAPSHOT_MIN_SIZE_PX": 256,
     # width of the snapshot thumbnail embedded in each map popup
     "SNAPSHOT_THUMBNAIL_WIDTH_PX": 320,

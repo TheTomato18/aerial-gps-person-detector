@@ -17,6 +17,7 @@ A two-stage pipeline for search-and-rescue style drone work:
 | `runs/` | Training outputs: weights, curves, metrics (git-ignored) |
 | `detections/` | Snapshot image of each confirmed detection (git-ignored) |
 | `flight_map.html` | Generated map, the output of the geolocation stage (git-ignored) |
+| [NOTICE](NOTICE) | Attribution for the upstream work this project ports (see [Acknowledgments](#acknowledgments)) |
 
 Only the two scripts and their supporting files are tracked; weights, datasets, footage, and generated outputs are all git-ignored, since they're large and may contain real GPS data.
 
@@ -91,6 +92,18 @@ Latest run (`heridal_yolo26n`, 100 epochs) on the validation split:
 - Python 3 with the packages in `requirements.txt` installed
 - A CUDA-capable GPU is strongly recommended for training; requires a CUDA-enabled PyTorch build (e.g. for Blackwell GPUs like the RTX 5070, `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128`)
 
+## Acknowledgments
+
+The geolocation stage is a Python port of [`src/renderMap.js`](https://github.com/roboflow/dji-aerial-georeferencing/blob/main/src/renderMap.js) from Roboflow's [dji-aerial-georeferencing](https://github.com/roboflow/dji-aerial-georeferencing), used under the Apache License 2.0. The approach for turning a detection's pixel position into a GPS coordinate is theirs: derive the ground distance a frame covers from the camera's field of view and the drone's altitude, project the detection's offset from frame center into a bearing and distance, then follow a rhumb line out from the drone. The clustering thresholds in `CONFIG` — 20 m merge distance, 3 frames to confirm — come from that project too, values included. Their write-up, [*Georeferencing Drone Videos*](https://blog.roboflow.com/georeferencing-drone-videos/), explains the method well.
+
+[drone_geolocation.py](drone_geolocation.py) is modified from the original: rewritten in Python, with Turf.js swapped for local rhumb-line and haversine implementations, Mapbox GL for Folium, Roboflow's hosted inference API for a local Ultralytics checkpoint behind a pluggable `DetectionModel`, flight-log parsing rebuilt on pandas, and per-detection snapshots added. [NOTICE](NOTICE) records this in full.
+
+Also with thanks to the authors of the HERIDAL dataset (see [Dataset](#dataset)), and to [Ultralytics](https://github.com/ultralytics/ultralytics) for YOLO.
+
 ## License
 
-MIT - see [LICENSE](LICENSE). Note the HERIDAL dataset itself is separately licensed CC BY 4.0.
+This project is MIT licensed — see [LICENSE](LICENSE).
+
+[drone_geolocation.py](drone_geolocation.py) derives from Apache-2.0 licensed work, so that license's terms apply to the parts taken from it; a copy is included as [LICENSE-APACHE-2.0](LICENSE-APACHE-2.0), and the attribution and record of changes is in [NOTICE](NOTICE).
+
+The HERIDAL dataset is separately licensed CC BY 4.0 and is not distributed here.
