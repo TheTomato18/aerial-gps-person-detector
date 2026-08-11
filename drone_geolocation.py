@@ -166,7 +166,6 @@ class FoundPoint:
     """
     location: Tuple[float, float]                     # mean (lon, lat) of `points`
     points: List[Tuple[float, float]] = field(default_factory=list)
-    visible: bool = False
     # highest-confidence snapshot seen for this cluster, and where it was saved
     snapshot: Optional[Snapshot] = None
     snapshot_path: Optional[str] = None
@@ -318,8 +317,6 @@ def _merge_or_add_detection(found_points: List[FoundPoint], lon: float, lat: flo
             # keep only the clearest look at this cluster
             if snapshot is not None and (fp.snapshot is None or snapshot.score > fp.snapshot.score):
                 fp.snapshot = snapshot
-            if len(fp.points) >= CONFIG["MIN_DETECTIONS_TO_MAKE_VISIBLE"]:
-                fp.visible = True
             return
 
     found_points.append(FoundPoint(location=(lon, lat), points=[(lon, lat)], snapshot=snapshot))
